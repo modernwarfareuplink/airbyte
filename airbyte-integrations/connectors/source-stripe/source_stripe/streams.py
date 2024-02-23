@@ -107,13 +107,8 @@ class StripeStream(HttpStream, ABC):
         return super().name
 
     def path(self, *args: Any, **kwargs: Any) -> str:
-        if self._path:
-            return self._path if isinstance(self._path, str) else self._path(self, *args, **kwargs)
-        # TODO alafanechere
-        # This raises the following type error because HttpStream.path is not implemented:
-        # Call to abstract method "path" of "HttpStream" with trivial body via super() is unsafe  [safe-super]
-        # I don't know of to safely fix it
-        return super().path(*args, **kwargs)  # type: ignore
+        assert self._path, "path must be set"
+        return self._path if isinstance(self._path, str) else self._path(self, *args, **kwargs)
 
     @property
     def use_cache(self) -> bool:
@@ -199,7 +194,7 @@ class StripeStream(HttpStream, ABC):
 
     def request_headers(
         self,
-        stream_state: Optional[Mapping[str, Any]],
+        stream_state: Optional[Mapping[str, Any]] = None,
         stream_slice: Optional[Mapping[str, Any]] = None,
         next_page_token: Optional[Mapping[str, Any]] = None,
     ) -> Mapping[str, Any]:
