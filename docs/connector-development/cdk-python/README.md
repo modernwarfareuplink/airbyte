@@ -128,4 +128,4 @@ All tests are located in the `unit_tests` directory. Run `pytest --cov=airbyte_c
 #### Publishing a new version to PyPi
 
 1. Open a PR
-2. Once it is approved and merge, an Airbyte member must run the `Publish CDK Manually` workflow using `release-type=major|manor|patch` and setting the changelog message.
+2. Once it is approved and merge, an Airbyte member must run the `Publish CDK Manually` workflow using `release-type=major|minor|patch` and setting the changelog message.
