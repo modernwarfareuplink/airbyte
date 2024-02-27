@@ -12,11 +12,11 @@ import io.debezium.connector.sqlserver.Lsn;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.sql.SQLException;
-import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.jooq.SQLDialect;
@@ -48,13 +48,19 @@ public class MsSQLTestDatabase extends TestDatabase<MSSQLServerContainer<?>, MsS
 
     NETWORK("withNetwork"),
     AGENT("withAgent"),
-    WITH_SSL_CERTIFICATES("withSslCertificates"),
+    WITH_SSL_CERTIFICATES("withSslCertificates", MsSQLTestDatabase::initWithSsl),
     ;
 
     public final String methodName;
+    private final Consumer<MsSQLTestDatabase> databaseModifier;
 
     ContainerModifier(final String methodName) {
+      this(methodName, null);
+    }
+
+    ContainerModifier(final String methodName, Consumer<MsSQLTestDatabase> databaseModifier) {
       this.methodName = methodName;
+      this.databaseModifier = databaseModifier;
     }
 
   }
@@ -63,10 +69,14 @@ public class MsSQLTestDatabase extends TestDatabase<MSSQLServerContainer<?>, MsS
     final String[] methodNames = Stream.of(methods).map(im -> im.methodName).toList().toArray(new String[0]);
     final var container = new MsSQLContainerFactory().shared(imageName.reference, methodNames);
     final var testdb = new MsSQLTestDatabase(container);
-    return testdb
-        .withConnectionProperty("encrypt", "false")
-        .withConnectionProperty("databaseName", testdb.getDatabaseName())
-        .initialized();
+    testdb.withConnectionProperty("encrypt", "false")
+        .withConnectionProperty("databaseName", testdb.getDatabaseName());
+    for (ContainerModifier modifier : methods) {
+      if (modifier.databaseModifier != null) {
+        modifier.databaseModifier.accept(testdb);
+      }
+    }
+    return testdb.initialized();
   }
 
   public MsSQLTestDatabase(final MSSQLServerContainer<?> container) {
@@ -74,16 +84,22 @@ public class MsSQLTestDatabase extends TestDatabase<MSSQLServerContainer<?>, MsS
     LOGGER.info("creating new database. databaseId=" + this.databaseId + ", databaseName=" + getDatabaseName());
   }
 
+  private void initWithSsl() {
+    withConnectionProperty("encrypt", "true");
+    withConnectionProperty("databaseName", getDatabaseName());
+    withConnectionProperty("trustServerCertificate", "true");
+  }
+
   public MsSQLTestDatabase withCdc() {
     return with("EXEC sys.sp_cdc_enable_db;");
   }
 
-  public synchronized MsSQLTestDatabase withCdcForTable(String schemaName, String tableName, String roleName) {
+  public MsSQLTestDatabase withCdcForTable(String schemaName, String tableName, String roleName) {
     String captureInstanceName = "%s_%s".formatted(schemaName, tableName);
     return withCdcForTable(schemaName, tableName, roleName, captureInstanceName);
   }
 
-  public synchronized MsSQLTestDatabase withCdcForTable(String schemaName, String tableName, String roleName, String captureInstanceName) {
+  public MsSQLTestDatabase withCdcForTable(String schemaName, String tableName, String roleName, String captureInstanceName) {
     final var enableCdcSqlFmt = """
                                 EXEC sys.sp_cdc_enable_table
                                 \t@source_schema = N'%s',
@@ -95,7 +111,10 @@ public class MsSQLTestDatabase extends TestDatabase<MSSQLServerContainer<?>, MsS
 
     for (int i = 0; i < MAX_RETRIES; i++) {
       try {
-        getDslContext().execute(enableCdcSqlFmt.formatted(schemaName, tableName, sqlRoleName, captureInstanceName));
+        synchronized (getContainer()) {
+          getDslContext().execute(
+              enableCdcSqlFmt.formatted(schemaName, tableName, sqlRoleName, captureInstanceName));
+        }
         return this;
       } catch (Exception e) {
         if (!e.getMessage().contains("The error returned was 14258: 'Cannot perform this operation while SQLServerAgent is starting.")) {
@@ -172,22 +191,21 @@ public class MsSQLTestDatabase extends TestDatabase<MSSQLServerContainer<?>, MsS
 
   public void waitForCdcRecords(String schemaName, String tableName, int recordCount)
       throws SQLException {
-    int maxTimeoutSec = 300;
     String sql = "SELECT count(*) FROM cdc.%s_%s_ct".formatted(schemaName, tableName);
-    int actualRecordCount;
-    Instant startTime = Instant.now();
-    Instant maxTime = startTime.plusSeconds(maxTimeoutSec);
-    do {
+    int actualRecordCount = 0;
+    for (int i = 0; i < MAX_RETRIES; i++) {
       LOGGER.info("fetching the number of CDC records for {}.{}", schemaName, tableName);
       actualRecordCount = query(ctx -> ctx.fetch(sql)).get(0).get(0, Integer.class);
-      LOGGER.info("Found {} CDC records for {}.{}. Expecting {}. Trying again", actualRecordCount, schemaName, tableName, recordCount);
-    } while (actualRecordCount < recordCount && maxTime.isAfter(Instant.now()));
-    if (actualRecordCount >= recordCount) {
-      LOGGER.info("found {} records!", actualRecordCount);
-    } else {
-      throw new RuntimeException(
-          "failed to find %d records after %s seconds. Only found %d!".formatted(recordCount, maxTimeoutSec, actualRecordCount));
+      if (actualRecordCount >= recordCount) {
+        LOGGER.info("found {} records!", actualRecordCount);
+        return;
+      }
+      LOGGER.info("Found {} CDC records for {}.{}. Expecting {}. Trying again", actualRecordCount,
+          schemaName, tableName, recordCount);
+      Uninterruptibles.sleepUninterruptibly(1, TimeUnit.SECONDS);
     }
+    throw new RuntimeException(
+        "failed to find %d records after %s seconds. Only found %d!".formatted(recordCount, MAX_RETRIES, actualRecordCount));
   }
 
   @Override
